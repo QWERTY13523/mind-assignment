@@ -1,206 +1,148 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""
-DeepLabV3-ResNet50 二分类（前景/背景）语义分割训练脚本（方案 B）
-- 先加载分割预训练权重（21 类），再将分类头替换为 2 类
-- 训练集 = VOC2007(trainval) ∪ VOC2012(trainval)
-- 验证集 = VOC2012(val)
-- 计算并打印 val_mIoU 与 per-class IoU
-- 仅将最后 1x1 卷积层改为 2 通道；其余权重保持预训练
-- 支持 ignore_index=255，二分类时把所有非 0 类并为前景=1（背景=0）
-
-用法示例：
-    python train_seg.py --data-root /path/to/VOCdevkit --epochs 50 --batch-size 8 --lr 0.01
-
-目录要求：
-    data-root/
-        VOC2007/
-            JPEGImages, SegmentationClass, ImageSets/Segmentation/{train.txt,val.txt}
-        VOC2012/
-            JPEGImages, SegmentationClass, ImageSets/Segmentation/{train.txt,val.txt}
-"""
-
-import os
-import math
-import time
-import random
 import argparse
-from typing import Tuple
+import os
+import random
+import time
+from typing import Tuple, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.backends.cudnn as cudnn
-from torch.utils.data import ConcatDataset, DataLoader, Dataset
+import torch.optim as optim
+from torch.utils.data import ConcatDataset, DataLoader
 from torchvision.datasets import VOCSegmentation
-from torchvision.models.segmentation import deeplabv3_resnet50, DeepLabV3_ResNet50_Weights
-import torchvision.transforms.functional as F
-from PIL import Image
+from torchvision.models.segmentation import deeplabv3_resnet50
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as TF
+
+# 兼容不同 torchvision 版本的权重枚举导入
+try:
+    from torchvision.models.segmentation import DeepLabV3_ResNet50_Weights
+except Exception:
+    from torchvision.models.segmentation.deeplabv3 import DeepLabV3_ResNet50_Weights
 
 
-# -----------------------------
-#  公共工具
-# -----------------------------
-def set_seed(seed: int = 3407):
+# ----------------------------
+#  工具函数
+# ----------------------------
+def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
+@torch.no_grad()
+def fast_confusion_matrix(
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        num_classes: int,
+        ignore_index: int = 255,
+) -> torch.Tensor:
+    """
+    pred:   (B,H,W) int64
+    target: (B,H,W) int64
+    return: (C,C) confusion matrix
+    """
+    assert pred.shape == target.shape
+    mask = target != ignore_index
+    pred = pred[mask]
+    target = target[mask]
+    k = (target >= 0) & (target < num_classes)
+    pred = pred[k]
+    target = target[k]
+    conf = torch.bincount(
+        target * num_classes + pred, minlength=num_classes ** 2
+    ).reshape(num_classes, num_classes)
+    return conf
+
+
+def miou_from_confmat(conf: torch.Tensor) -> Tuple[float, torch.Tensor]:
+    """
+    conf: (C,C)
+    return: (mIoU, per_class_IoU)  都是 float 张量
+    """
+    conf = conf.float()
+    tp = torch.diag(conf)
+    fp = conf.sum(0) - tp
+    fn = conf.sum(1) - tp
+    denom = tp + fp + fn
+    valid = denom > 0
+    iou = torch.zeros_like(tp)
+    iou[valid] = tp[valid] / denom[valid]
+    miou = iou[valid].mean().item() if valid.any() else 0.0
+    return miou, iou
+
+
+# ----------------------------
+#  联合图像/掩码变换
+# ----------------------------
+class JointResizeFlipToTensor:
+    """
+    - 统一 Resize 到给定 size
+    - 训练时随机水平翻转
+    - 图像：ToTensor + Normalize
+    - 掩码：转 Long，不做归一化；保持 NEAREST 插值，保留 255 ignore
+    """
+
+    def __init__(self, size: int = 512, train: bool = True):
+        self.size = size
+        self.train = train
+        self.mean = [0.485, 0.456, 0.406]
+        self.std = [0.229, 0.224, 0.225]
+
+    def __call__(self, img, mask):
+        # Resize
+        img = TF.resize(img, (self.size, self.size), interpolation=InterpolationMode.BILINEAR)
+        mask = TF.resize(mask, (self.size, self.size), interpolation=InterpolationMode.NEAREST)
+
+        # Random horizontal flip (train only)
+        if self.train and random.random() < 0.5:
+            img = TF.hflip(img)
+            mask = TF.hflip(mask)
+
+        # ToTensor / Normalize
+        img = TF.to_tensor(img)
+        img = TF.normalize(img, mean=self.mean, std=self.std)
+
+        # mask -> tensor long（保留原始类别id/255）
+        mask = torch.as_tensor(np.array(mask, dtype=np.int64), dtype=torch.long)
+
+        return img, mask
+
+
 def to_fg_bg(mask: torch.Tensor, ignore_index: int = 255) -> torch.Tensor:
     """
-    将 VOC 多类标签映射为前景/背景二类：
-      - 背景(0) 保留为 0
-      - 所有 >0 的类别并为 1
-      - ignore(255) 保持 255
-    输入 mask(tensor, HxW) 的 dtype 为 long/int
+    将 VOC 的 21 类合并为 {0:背景, 1:前景}，255 保持为 ignore。
+    假设 mask ∈ {0..21} ∪ {255}，其中 0=背景，1..20=前景，21（若存在）也视作前景。
     """
-    out = mask.clone()
-    ignore = (out == ignore_index)
-    out = torch.where(out > 0, torch.tensor(1, dtype=out.dtype), out)
-    out[ignore] = ignore_index
-    return out
+    m = mask.clone()
+    ign = (m == ignore_index)
+    # >0 的都视为前景
+    m[(m > 0) & (m != ignore_index)] = 1
+    m[ign] = ignore_index
+    return m
 
 
-# -----------------------------
-#  变换：保证图像与掩码同步
-# -----------------------------
-class SegTrainTransform:
-    """训练增广：随机缩放、随机裁剪、随机翻转、归一化"""
-
-    def __init__(self, crop_size: int = 512, min_scale: float = 0.5, max_scale: float = 2.0):
-        self.crop_size = crop_size
-        self.min_scale = min_scale
-        self.max_scale = max_scale
-        # ImageNet 归一化
-        self.mean = [0.485, 0.456, 0.406]
-        self.std = [0.229, 0.224, 0.225]
-
-    def __call__(self, img: Image.Image, mask: Image.Image) -> Tuple[torch.Tensor, torch.Tensor]:
-        # 随机缩放（等比例）
-        w, h = img.size
-        scale = random.uniform(self.min_scale, self.max_scale)
-        new_w, new_h = int(w * scale), int(h * scale)
-        img = F.resize(img, (new_h, new_w), interpolation=Image.BILINEAR)
-        mask = F.resize(mask, (new_h, new_w), interpolation=Image.NEAREST)
-
-        # 随机水平翻转
-        if random.random() < 0.5:
-            img = F.hflip(img)
-            mask = F.hflip(mask)
-
-        # 随机裁剪（必要时先填充）
-        pad_h = max(self.crop_size - new_h, 0)
-        pad_w = max(self.crop_size - new_w, 0)
-        if pad_h > 0 or pad_w > 0:
-            # 图像用 0 填充，掩码用 255(ignore) 填充
-            img = F.pad(img, [0, 0, pad_w, pad_h], fill=0)
-            mask = F.pad(mask, [0, 0, pad_w, pad_h], fill=255)
-            new_w, new_h = img.size
-
-        # 在有效范围内随机裁剪
-        top = random.randint(0, new_h - self.crop_size)
-        left = random.randint(0, new_w - self.crop_size)
-        img = F.crop(img, top, left, self.crop_size, self.crop_size)
-        mask = F.crop(mask, top, left, self.crop_size, self.crop_size)
-
-        # 转张量与归一化 / 标签转 long
-        img = F.to_tensor(img)
-        img = F.normalize(img, mean=self.mean, std=self.std)
-
-        mask = torch.from_numpy(np.array(mask, dtype=np.int64))
-        mask = to_fg_bg(mask, ignore_index=255)
-
-        return img, mask
-
-
-class SegValTransform:
-    """验证变换：等比例缩放长边到指定最大尺寸，保持分辨率，归一化"""
-
-    def __init__(self, long_side_max: int = 768):
-        self.long_side_max = long_side_max
-        self.mean = [0.485, 0.456, 0.406]
-        self.std = [0.229, 0.224, 0.225]
-
-    def __call__(self, img: Image.Image, mask: Image.Image) -> Tuple[torch.Tensor, torch.Tensor]:
-        w, h = img.size
-        long_side = max(h, w)
-        if long_side > self.long_side_max:
-            scale = self.long_side_max / long_side
-            new_w, new_h = int(round(w * scale)), int(round(h * scale))
-            img = F.resize(img, (new_h, new_w), interpolation=Image.BILINEAR)
-            mask = F.resize(mask, (new_h, new_w), interpolation=Image.NEAREST)
-
-        img = F.to_tensor(img)
-        img = F.normalize(img, mean=self.mean, std=self.std)
-
-        mask = torch.from_numpy(np.array(mask, dtype=np.int64))
-        mask = to_fg_bg(mask, ignore_index=255)
-
-        return img, mask
-
-
-# -----------------------------
-#  包装数据集以应用成对变换
-# -----------------------------
-class VOCPairDataset(Dataset):
-    def __init__(self, voc: VOCSegmentation, transform):
-        self.voc = voc
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.voc)
-
-    def __getitem__(self, idx):
-        img, target = self.voc[idx]  # PIL.Image
-        img, target = self.transform(img, target)
-        return img, target
-
-
-def build_datasets(data_root: str):
-    """
-    训练集：VOC2007(trainval) ∪ VOC2012(trainval)
-    验证集：VOC2012(val)
-    """
-    # 训练
-    tf_train = SegTrainTransform(crop_size=512, min_scale=0.5, max_scale=2.0)
-    ds07_tr = VOCPairDataset(VOCSegmentation(root=data_root, year="2007", image_set="train"), tf_train)
-    ds07_va = VOCPairDataset(VOCSegmentation(root=data_root, year="2007", image_set="val"), tf_train)
-    ds12_tr = VOCPairDataset(VOCSegmentation(root=data_root, year="2012", image_set="train"), tf_train)
-    ds12_va = VOCPairDataset(VOCSegmentation(root=data_root, year="2012", image_set="val"), tf_train)
-    train_set = ConcatDataset([ds07_tr, ds07_va, ds12_tr, ds12_va])
-
-    # 验证
-    tf_val = SegValTransform(long_side_max=768)
-    val_set = VOCPairDataset(VOCSegmentation(root=data_root, year="2012", image_set="val"), tf_val)
-
-    return train_set, val_set
-
-
-# -----------------------------
-#  模型：方案 B
-# -----------------------------
+# ----------------------------
+#  模型构建（方案 B）
+# ----------------------------
 def build_deeplabv3_2c(aux_loss: bool = True) -> nn.Module:
-    """
-    先加载 COCO(VOC mapping) 的分割预训练权重（21 类），再替换头为 2 类。
-    """
-    model = deeplabv3_resnet50(
-        weights=DeepLabV3_ResNet50_Weights.COCO_WITH_VOC_LABELS_V1,
-        aux_loss=aux_loss
-    )
+    # 1) 载入分割预训练（21 类 VOC mapping）
+    weights = DeepLabV3_ResNet50_Weights.COCO_WITH_VOC_LABELS_V1
+    model = deeplabv3_resnet50(weights=weights, aux_loss=aux_loss)
 
-    # 替换主头
-    in_ch = model.classifier[-1].in_channels  # 256
+    # 2) 替换分类头 &（可选）辅助头为 2 类
+    in_ch = model.classifier[-1].in_channels
     model.classifier[-1] = nn.Conv2d(in_ch, 2, kernel_size=1)
 
-    # 替换辅助头
-    if aux_loss and hasattr(model, "aux_classifier") and model.aux_classifier is not None:
+    if aux_loss and model.aux_classifier is not None:
         in_ch_aux = model.aux_classifier[-1].in_channels
         model.aux_classifier[-1] = nn.Conv2d(in_ch_aux, 2, kernel_size=1)
 
-    # 初始化新加层
+    # 3) 初始化新头参数
     heads = [model.classifier[-1]]
     if aux_loss and model.aux_classifier is not None:
         heads.append(model.aux_classifier[-1])
@@ -212,214 +154,229 @@ def build_deeplabv3_2c(aux_loss: bool = True) -> nn.Module:
     return model
 
 
-# -----------------------------
-#  优化器与调度
-# -----------------------------
-def build_optimizer(model: nn.Module, base_lr: float = 0.01, weight_decay: float = 1e-4):
-    # 新头学习率大，骨干小（常见设置）
-    params = [
-        {"params": model.backbone.parameters(), "lr": base_lr * 0.1},
-        {"params": model.classifier.parameters(), "lr": base_lr},
-    ]
-    if hasattr(model, "aux_classifier") and model.aux_classifier is not None:
-        params.append({"params": model.aux_classifier.parameters(), "lr": base_lr})
-    optimizer = torch.optim.SGD(params, momentum=0.9, weight_decay=weight_decay, nesterov=True)
-    return optimizer
-
-
-class PolyLR(torch.optim.lr_scheduler._LRScheduler):
+# ----------------------------
+#  数据集构建
+# ----------------------------
+def build_datasets(
+        voc2007_root: str,
+        voc2012_root: Optional[str],
+        val_year: str = "2007",
+        val_split: str = "val",
+        size: int = 512,
+):
     """
-    Poly 学习率计划：lr = lr_init * (1 - iter/max_iter) ^ power
-    通常用于语义分割
+    vocXXXX_root: 指向包含 VOCdevkit 的目录（即该目录下应有 VOCdevkit/VOC2007 或 VOC2012）
+    训练集：合并 2007 trainval (+ 可选 2012 trainval)
+    验证集：2007 的 val（如你本地确有 test 分割标注，可把 val_split 改为 'test'）
     """
-    def __init__(self, optimizer, max_iters, power=0.9, last_epoch=-1):
-        self.max_iters = max_iters
-        self.power = power
-        super().__init__(optimizer, last_epoch)
+    train_tf = JointResizeFlipToTensor(size=size, train=True)
+    eval_tf = JointResizeFlipToTensor(size=size, train=False)
 
-    def get_lr(self):
-        factor = (1 - self.last_epoch / float(self.max_iters)) ** self.power
-        return [base_lr * factor for base_lr in self.base_lrs]
+    # 2007 trainval
+    ds07_train = VOCSegmentation(
+        root=voc2007_root,
+        year="2007",
+        image_set="trainval",
+        download=False,
+        transforms=train_tf,  # 注意：是 transforms（联合 img & target）
+    )
 
+    datasets = [ds07_train]
 
-# -----------------------------
-#  指标：mIoU
-# -----------------------------
-@torch.no_grad()
-def miou_from_logits(logits: torch.Tensor, target: torch.Tensor, num_classes=2, ignore_index=255):
-    """
-    单批次计算混淆矩阵并返回 (miou, per_class_iou, confmat)
-    logits: [B, C, H, W]
-    target: [B, H, W]
-    """
-    pred = logits.argmax(dim=1)  # [B,H,W]
+    # 2012 trainval（可选）
+    if voc2012_root is not None and os.path.isdir(voc2012_root):
+        ds12_train = VOCSegmentation(
+            root=voc2012_root,
+            year="2012",
+            image_set="trainval",
+            download=False,
+            transforms=train_tf,
+        )
+        datasets.append(ds12_train)
 
-    mask = target != ignore_index
-    pred = pred[mask]
-    target = target[mask]
+    train_dataset = ConcatDataset(datasets)
 
-    if target.numel() == 0:
-        iou = torch.zeros(num_classes, device=logits.device)
-        return torch.tensor(0.0, device=logits.device), iou, torch.zeros(num_classes, num_classes, device=logits.device)
+    # 验证集（默认 2007 val）
+    val_dataset = VOCSegmentation(
+        root=voc2007_root,
+        year=val_year,
+        image_set=val_split,  # 'val'；若你有 test 的标注且路径正确，可改为 'test'
+        download=False,
+        transforms=eval_tf,
+    )
 
-    k = (target >= 0) & (target < num_classes)
-    pred = pred[k]
-    target = target[k]
-
-    conf = torch.bincount(
-        target * num_classes + pred,
-        minlength=num_classes ** 2
-    ).reshape(num_classes, num_classes).float()
-
-    tp = conf.diag()
-    fp = conf.sum(0) - tp
-    fn = conf.sum(1) - tp
-    denom = tp + fp + fn
-    valid = denom > 0
-    iou = torch.zeros(num_classes, device=logits.device)
-    iou[valid] = tp[valid] / denom[valid]
-    miou = iou[valid].mean() if valid.any() else torch.tensor(0.0, device=logits.device)
-    return miou, iou, conf
+    return train_dataset, val_dataset
 
 
-# -----------------------------
-#  训练 / 验证
-# -----------------------------
-def train_one_epoch(model, loader, optimizer, scaler, device, epoch, scheduler=None, aux_weight=0.4):
+# ----------------------------
+#  训练 / 验证循环
+# ----------------------------
+def train_one_epoch(model, loader, optimizer, device, epoch, aux_loss=True, ignore_index=255):
     model.train()
-    criterion = nn.CrossEntropyLoss(ignore_index=255)
+    criterion = nn.CrossEntropyLoss(ignore_index=ignore_index)
     running_loss = 0.0
-    num_iters = len(loader)
 
-    start = time.time()
-    for it, (images, targets) in enumerate(loader, 1):
-        images = images.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
+    t0 = time.time()
+    for it, (imgs, masks) in enumerate(loader):
+        imgs = imgs.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+
+        # 二分类：将所有前景并到 1
+        masks = to_fg_bg(masks, ignore_index=ignore_index)
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(enabled=scaler is not None):
-            out = model(images)
-            logits = out["out"]
-            loss = criterion(logits, targets)
-            if "aux" in out and out["aux"] is not None:
-                loss = loss + aux_weight * criterion(out["aux"], targets)
+        outputs = model(imgs)
 
-        if scaler is not None:
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            optimizer.step()
+        loss = criterion(outputs["out"], masks)
+        if aux_loss and ("aux" in outputs):
+            loss = loss + 0.4 * criterion(outputs["aux"], masks)
 
-        if scheduler is not None:
-            scheduler.step()
+        loss.backward()
+        optimizer.step()
 
         running_loss += loss.item()
 
-        if it % 20 == 0 or it == num_iters:
-            lr_head = optimizer.param_groups[1]["lr"] if len(optimizer.param_groups) > 1 else optimizer.param_groups[0]["lr"]
-            print(f"Epoch[{epoch}] Iter[{it}/{num_iters}]  loss={loss.item():.4f}  lr_head={lr_head:.6f}")
+        if (it + 1) % 50 == 0:
+            avg = running_loss / (it + 1)
+            print(f"[Epoch {epoch}] iter {it + 1}/{len(loader)}  loss={avg:.4f}")
 
-    cost = time.time() - start
-    return running_loss / num_iters, cost
+    elapsed = time.time() - t0
+    return running_loss / max(1, len(loader)), elapsed
 
 
 @torch.no_grad()
-def validate(model, loader, device):
+def evaluate(model, loader, device, ignore_index=255):
     model.eval()
-    total_conf = torch.zeros(2, 2, device=device)
-    total_iou = torch.zeros(2, device=device)
-    count = 0
+    num_classes = 2
+    conf_total = torch.zeros(num_classes, num_classes, dtype=torch.int64, device=device)
 
-    for images, targets in loader:
-        images = images.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
+    for imgs, masks in loader:
+        imgs = imgs.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+        masks = to_fg_bg(masks, ignore_index=ignore_index)
 
-        out = model(images)
-        logits = out["out"]
-        miou_b, iou_b, conf_b = miou_from_logits(logits, targets, num_classes=2, ignore_index=255)
-        total_conf += conf_b
-        total_iou += iou_b
-        count += 1
+        outputs = model(imgs)["out"]  # (B,2,H,W)
+        pred = outputs.argmax(dim=1)  # (B,H,W)
 
-    # 用总体混淆矩阵计算一次全局 IoU（更稳健）
-    tp = total_conf.diag()
-    fp = total_conf.sum(0) - tp
-    fn = total_conf.sum(1) - tp
-    denom = tp + fp + fn
-    valid = denom > 0
-    iou = torch.zeros(2, device=device)
-    iou[valid] = tp[valid] / denom[valid]
-    miou = iou[valid].mean() if valid.any() else torch.tensor(0.0, device=device)
+        conf = fast_confusion_matrix(pred, masks, num_classes=num_classes, ignore_index=ignore_index)
+        conf_total += conf
 
-    return miou.item(), iou.detach().cpu().tolist()
+    miou, ious = miou_from_confmat(conf_total.cpu())
+    return miou, ious.cpu().tolist()
 
 
-# -----------------------------
-#  主流程
-# -----------------------------
-def main():
-    parser = argparse.ArgumentParser(description="DeepLabV3-ResNet50 二分类（前景/背景）训练（方案B）")
-    parser.add_argument("--data-root", type=str, required=True, help="VOCdevkit 根目录（包含 VOC2007 与/或 VOC2012）")
-    parser.add_argument("--epochs", type=int, default=50)
+# ----------------------------
+#  主函数
+# ----------------------------
+def parse_args():
+    parser = argparse.ArgumentParser("DeepLabV3-ResNet50 前景/背景二分类（方案B）训练脚本")
+    parser.add_argument("--voc2007-root", type=str, required=True,
+                        help="包含 VOCdevkit 的 2007 根目录，例如 /path/to/VOCtrainval_06-Nov-2007")
+    parser.add_argument("--voc2012-root", type=str, default=None,
+                        help="可选：包含 VOCdevkit 的 2012 根目录，例如 /path/to/VOCtrainval_11-May-2012")
+    parser.add_argument("--val-year", type=str, default="2007", choices=["2007", "2012"])
+    parser.add_argument("--val-split", type=str, default="val", choices=["val", "test"],
+                        help="默认使用 2007 的 val 做验证；如你确实有 test 的分割标注可改为 test")
+    parser.add_argument("--size", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--workers", type=int, default=6)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=0.01)
+    parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--amp", action="store_true", help="使用混合精度")
-    parser.add_argument("--output", type=str, default="./checkpoints")
-    parser.add_argument("--seed", type=int, default=3407)
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--aux-loss", action="store_true", default=True)
+    parser.add_argument("--no-aux-loss", dest="aux_loss", action="store_false")
+    parser.add_argument("--save-path", type=str, default="checkpoints/deeplabv3_2c_best.pth")
+    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
+    return args
 
-    os.makedirs(args.output, exist_ok=True)
+
+def main():
+    args = parse_args()
+    os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
     set_seed(args.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    cudnn.benchmark = True
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    print(f"Use device: {device}")
 
-    print(">> 构建数据集...")
-    train_set, val_set = build_datasets(args.data_root)
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.workers, pin_memory=True, drop_last=True)
-    val_loader = DataLoader(val_set, batch_size=max(1, args.batch_size // 2), shuffle=False,
-                            num_workers=args.workers, pin_memory=True)
+    # 构建数据集 & 数据加载器
+    train_ds, val_ds = build_datasets(
+        voc2007_root=args.voc2007_root,
+        voc2012_root=args.voc2012_root,
+        val_year=args.val_year,
+        val_split=args.val_split,
+        size=args.size,
+    )
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.workers, pin_memory=True, drop_last=True
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=True
+    )
+    print(f"Train samples: {len(train_ds)} | Val samples: {len(val_ds)}")
 
-    print(f"训练样本数: {len(train_set)} | 验证样本数: {len(val_set)}")
+    # 构建模型（方案B）
+    model = build_deeplabv3_2c(aux_loss=args.aux_loss)
+    model.to(device)
 
-    print(">> 构建模型（方案 B）...")
-    model = build_deeplabv3_2c(aux_loss=True).to(device)
-    optimizer = build_optimizer(model, base_lr=args.lr, weight_decay=args.weight_decay)
+    # 分组学习率：骨干小，头部大
+    param_groups = [
+        {"params": model.backbone.parameters(), "lr": args.lr * 0.1},
+        {"params": model.classifier.parameters(), "lr": args.lr},
+    ]
+    if args.aux_loss and (getattr(model, "aux_classifier", None) is not None):
+        param_groups.append({"params": model.aux_classifier.parameters(), "lr": args.lr})
 
-    max_iters = args.epochs * len(train_loader)
-    scheduler = PolyLR(optimizer, max_iters=max_iters, power=0.9)
+    optimizer = optim.SGD(param_groups, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=max(1, args.epochs // 3), gamma=0.1)
 
-    scaler = torch.cuda.amp.GradScaler() if (args.amp and device.type == "cuda") else None
-
+    # 可选：加载断点
+    start_epoch = 1
     best_miou = 0.0
-    best_path = os.path.join(args.output, "best_miou.pth")
+    if args.resume is not None and os.path.isfile(args.resume):
+        ckpt = torch.load(args.resume, map_location="cpu")
+        if "model" in ckpt:
+            model.load_state_dict(ckpt["model"], strict=False)
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        best_miou = ckpt.get("best_miou", 0.0)
+        start_epoch = ckpt.get("epoch", 0) + 1
+        print(f"Resumed from {args.resume}: epoch={start_epoch} best_mIoU={best_miou:.4f}")
 
-    print(">> 开始训练")
-    global_iter = 0
-    for epoch in range(1, args.epochs + 1):
-        avg_loss, t_cost = train_one_epoch(model, train_loader, optimizer, scaler, device, epoch, scheduler)
-        print(f"[Epoch {epoch}] train_loss={avg_loss:.4f}  time={t_cost:.1f}s")
+    # 训练
+    for epoch in range(start_epoch, args.epochs + 1):
+        train_loss, sec = train_one_epoch(model, train_loader, optimizer, device, epoch, aux_loss=args.aux_loss)
+        scheduler.step()
 
-        val_miou, per_class_iou = validate(model, val_loader, device)
-        print(f"[Epoch {epoch}] val_mIoU={val_miou:.4f}  IoU_bg={per_class_iou[0]:.4f}  IoU_fg={per_class_iou[1]:.4f}")
+        val_miou, per_class = evaluate(model, val_loader, device)
+        print(f"[Epoch {epoch}] train_loss={train_loss:.4f}  "
+              f"val_mIoU={val_miou:.4f}  (bg={per_class[0]:.4f}, fg={per_class[1]:.4f})  "
+              f"time={sec:.1f}s")
 
+        # 保存最优
         if val_miou > best_miou:
             best_miou = val_miou
-            torch.save({
-                "epoch": epoch,
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "best_mIoU": best_miou,
-                "args": vars(args)
-            }, best_path)
-            print(f">> 已保存最佳模型至: {best_path} (mIoU={best_miou:.4f})")
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "best_miou": best_miou,
+                    "args": vars(args),
+                },
+                args.save_path,
+            )
+            print(f"✅  Saved best to {args.save_path} (mIoU={best_miou:.4f})")
 
-    print(f"训练结束。最佳验证 mIoU = {best_miou:.4f}")
+    print(f"Training done. Best val_mIoU={best_miou:.4f}")
 
 
 if __name__ == "__main__":
