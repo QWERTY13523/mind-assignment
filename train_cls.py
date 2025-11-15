@@ -113,14 +113,14 @@ def main():
     ap.add_argument("--voc2007-root", type=str, required=True, help=".../VOCdevkit/VOC2007")
     ap.add_argument("--voc2012-root", type=str, required=True, help=".../VOCdevkit/VOC2012")
     ap.add_argument("--seg-ckpt", type=str, default="checkpoints/seg/best.pth")
-    ap.add_argument("--epochs", type=int, default=80)
-    ap.add_argument("--batch-size", type=int, default=32)
-    ap.add_argument("--img-size", type=int, default=448)
+    ap.add_argument("--epochs", type=int, default=50)
+    ap.add_argument("--batch-size", type=int, default=64)
+    ap.add_argument("--img-size", type=int, default=512)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--device", type=str, default="cuda:2")
-    ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument("--num-workers", type=int, default=24)
     ap.add_argument("--lam", type=float, default=0.3)
-    ap.add_argument("--gate-alpha", type=float, default=0.8)
+    ap.add_argument("--gate-alpha", type=float, default=0.7)
     ap.add_argument("--mask-strategy", type=str, default="mixed",
                     choices=["maskonly","blur","randbg","mixed"])
     ap.add_argument("--bg-dir", type=str, default=None)
@@ -132,10 +132,11 @@ def main():
     ap.add_argument("--no-channels-last", dest="channels_last", action="store_false")
     ap.add_argument("--accum", type=int, default=1, help="梯度累积步数")
     ap.add_argument("--seg-infer-size", type=int, default=256, help="分割掩膜的推理短边（None=不降采样）")
+    ap.add_argument("--resume", type=str, default="", help="checkpoint 路径，用于继续训练")
+
     args = ap.parse_args()
 
-    device = torch.device("cuda:0")
-    print(device)
+    device = torch.device("cuda:3")
     # TF32（Amp下进一步加速/省显存，NVIDIA Ampere+）
     try:
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -151,7 +152,27 @@ def main():
     if args.channels_last:
         cls_model = cls_model.to(memory_format=torch.channels_last)
 
-    print(1)
+    start_epoch = 1
+    best = 0.0
+
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print(f"=> resume from checkpoint: {args.resume}")
+            ckpt = torch.load(args.resume, map_location="cpu")
+            state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+            # 为了兼容性，strict=False，防止你以后稍微改网络结构
+            missing, unexpected = cls_model.load_state_dict(state, strict=False)
+            print(
+                f"   loaded epoch={ckpt.get('epoch', '?')}, "
+                f"mAP={ckpt.get('mAP', 0.0):.4f}, "
+                f"missing={len(missing)}, unexpected={len(unexpected)}"
+            )
+            best = float(ckpt.get("mAP", 0.0))
+            start_epoch = int(ckpt.get("epoch", 0)) + 1
+        else:
+            print(f"[warn] resume checkpoint not found: {args.resume}")
+    else:
+        print("=> train from scratch (no resume)")
     # 训练集 = VOC2007 trainval ∪ VOC2012 trainval
     ds07 = VOCDatasetMainCLS(args.voc2007_root, split="trainval", img_size=args.img_size, random_flip=True)
     ds12 = VOCDatasetMainCLS(args.voc2012_root, split="trainval", img_size=args.img_size, random_flip=True)
@@ -160,19 +181,16 @@ def main():
     # 测试集 = VOC2007 test
     test_set  = VOCDatasetMainCLS(args.voc2007_root, split="test", img_size=args.img_size, random_flip=False)
 
-    print(1)
     tl = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
                     num_workers=args.num_workers, pin_memory=True, drop_last=True)
     vl = DataLoader(test_set,  batch_size=args.batch_size, shuffle=False,
                     num_workers=args.num_workers, pin_memory=True)
 
-    print(1)
     opt = torch.optim.AdamW(cls_model.parameters(), lr=args.lr, weight_decay=1e-4)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     scaler = GradScaler(enabled=args.amp)
-    best = 0.0
 
-    for ep in range(1, args.epochs + 1):
+    for ep in range(start_epoch, args.epochs + 1):
         cls_model.train();
         tot = 0.0
         opt.zero_grad(set_to_none=True)
@@ -183,48 +201,44 @@ def main():
             if args.channels_last:
                 x = x.to(memory_format=torch.channels_last)
 
-            # 1) 先做分割掩膜（无梯度，低分辨率）
+            # 1) 用分割器生成 mask 和 x_aug（保持不变）
             with torch.no_grad():
                 mask = make_mask(seg_model, x, seg_infer_size=args.seg_infer_size, amp=args.amp).to(dtype=x.dtype)
                 x_aug = apply_strategy(x, mask, args.mask_strategy, args.bg_dir)
                 if args.channels_last:
                     x_aug = x_aug.to(memory_format=torch.channels_last)
 
-            # 梯度累积起点时清空 grad
             if (bidx - 1) % max(1, args.accum) == 0:
                 opt.zero_grad(set_to_none=True)
 
-            # 2) 主分支前向 + 分类损失（只保留这一分支的计算图）
+            # 2) 主分支：原图 BCE
             with autocast(enabled=args.amp):
                 logits = cls_model(x, mask if args.gate_alpha > 0 else None)
-                loss_cls = multilabel_bce_with_logits(logits, y)
-                prob = torch.sigmoid(logits).detach()  # 供一致性用，但不回传到主分支
-                loss_main = loss_cls / max(1, args.accum)
+                loss_main = multilabel_bce_with_logits(logits, y)
+                loss_main = loss_main / max(1, args.accum)
 
             scaler.scale(loss_main).backward()
-            # 释放主分支中间激活，降低峰值显存
             del logits, x
             torch.cuda.empty_cache()
 
-            # 3) 增强分支前向 + 一致性损失（只对增强分支回传）
+            # 3) 增强分支：掩膜增强图 BCE（带权重 lam）
             with autocast(enabled=args.amp):
                 logits_aug = cls_model(x_aug, mask if args.gate_alpha > 0 else None)
-                prob_aug = torch.sigmoid(logits_aug)
-                loss_cons = args.lam * sym_kl_bernoulli(prob, torch.clamp(prob_aug, 1e-6, 1 - 1e-6))
-                loss_cons = loss_cons / max(1, args.accum)
+                loss_aug = multilabel_bce_with_logits(logits_aug, y)
+                loss_aug = args.lam * loss_aug  # lam 当权重
+                loss_aug = loss_aug / max(1, args.accum)
 
-            scaler.scale(loss_cons).backward()
-            del logits_aug, x_aug, prob_aug  # 及时释放
+            scaler.scale(loss_aug).backward()
+            del logits_aug, x_aug
             torch.cuda.empty_cache()
 
-            # step（按累积步数）
+            # 4) 梯度更新
             if (bidx % max(1, args.accum)) == 0:
                 scaler.step(opt)
                 scaler.update()
                 opt.zero_grad(set_to_none=True)
 
-            # 统计
-            tot += (loss_main.item() + loss_cons.item()) * (b["image"].size(0))
+            tot += (loss_main.item() + loss_aug.item()) * (b["image"].size(0))
 
         # 若最后不足一个accum，补一次step
         if (len(tl) % max(1, args.accum)) != 0:
@@ -246,5 +260,4 @@ def main():
 
 
 if __name__ == "__main__":
-    print(1)
     main()

@@ -1,0 +1,35 @@
+Using device: cuda:2
+=> train from scratch (no resume)
+[Baseline][Epoch 001] loss=0.126191  mAP(test2007)=0.7204  F1=0.6966
+  >> save checkpoints/cls_baseline/best.pth (mAP=0.7204)
+[Baseline][Epoch 002] loss=0.090878  mAP(test2007)=0.7763  F1=0.7368
+  >> save checkpoints/cls_baseline/best.pth (mAP=0.7763)
+[Baseline][Epoch 003] loss=0.077127  mAP(test2007)=0.8045  F1=0.7674
+  >> save checkpoints/cls_baseline/best.pth (mAP=0.8045)
+[Baseline][Epoch 004] loss=0.067327  mAP(test2007)=0.8289  F1=0.7929
+  >> save checkpoints/cls_baseline/best.pth (mAP=0.8289)
+[Baseline][Epoch 005] loss=0.058041  mAP(test2007)=0.8520  F1=0.8249
+  >> save checkpoints/cls_baseline/best.pth (mAP=0.8520)
+[Baseline][Epoch 006] loss=0.048736  mAP(test2007)=0.8497  F1=0.8103
+[Baseline][Epoch 007] loss=0.041174  mAP(test2007)=0.8516  F1=0.8223
+[Baseline][Epoch 008] loss=0.032440  mAP(test2007)=0.8458  F1=0.8189
+[Baseline][Epoch 009] loss=0.024994  mAP(test2007)=0.8551  F1=0.8305
+  >> save checkpoints/cls_baseline/best.pth (mAP=0.8551)
+[Baseline][Epoch 010] loss=0.019902  mAP(test2007)=0.8634  F1=0.8348
+  >> save checkpoints/cls_baseline/best.pth (mAP=0.8634)
+[Baseline][Epoch 011] loss=0.012838  mAP(test2007)=0.8636  F1=0.8430
+  >> save checkpoints/cls_baseline/best.pth (mAP=0.8636)
+[Baseline][Epoch 012] loss=0.009016  mAP(test2007)=0.8718  F1=0.8476
+  >> save checkpoints/cls_baseline/best.pth (mAP=0.8718)
+[Baseline][Epoch 013] loss=0.005511  mAP(test2007)=0.8733  F1=0.8469
+  >> save checkpoints/cls_baseline/best.pth (mAP=0.8733)
+[Baseline][Epoch 014] loss=0.003974  mAP(test2007)=0.8742  F1=0.8534
+  >> save checkpoints/cls_baseline/best.pth (mAP=0.8742)
+[Baseline][Epoch 015] loss=0.002663  mAP(test2007)=0.8843  F1=0.8650
+  >> save checkpoints/cls_baseline/best.pth (mAP=0.8843)
+[Baseline][Epoch 016] loss=0.001538  mAP(test2007)=0.8809  F1=0.8632
+[Baseline][Epoch 017] loss=0.001060  mAP(test2007)=0.8842  F1=0.8640
+[Baseline][Epoch 018] loss=0.000739  mAP(test2007)=0.8832  F1=0.8644
+[Baseline][Epoch 019] loss=0.000571  mAP(test2007)=0.8856  F1=0.8656
+  >> save checkpoints/cls_baseline/best.pth (mAP=0.8856)
+[Baseline][Epoch 020] loss=0.000522  mAP(test2007)=0.8822  F1=0.8655
