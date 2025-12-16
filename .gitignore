@@ -1,0 +1,14 @@
+.gradio/
+.idea/
+
+checkpoints/
+checkpoints_ablation_cnn/
+dataset/
+debug_batch.png
+qualitative_result.png
+vis_result_best.png
+__pycache__/
+*.pyc
+*.pkl
+*.pth
+*.log
